@@ -71,7 +71,7 @@ class DetectFaces:
                 'image': ('IMAGE',),
                 'threshold': ('FLOAT', {'default': 0.5, 'min': 0.0, 'max': 1.0, 'step': 0.01}),
                 'min_size': ('INT', {'default': 64, 'max': 512, 'step': 8}),
-                'max_size': ('INT', {'default': 512, 'min': 512, 'step': 8}),
+                'max_size': ('INT', {'default': 4096, 'min': 128, 'step': 8}),
             },
             'optional': {
                 'mask': ('MASK',),
@@ -192,6 +192,210 @@ class WarpFaceBack:
         results = torch.stack(results)
         return (results, )
     
+class WarpFaceBackFeathered:
+    RETURN_TYPES = ('IMAGE',)
+    FUNCTION = 'run'
+    CATEGORY = 'facetools'
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            'required': {
+                'images': ('IMAGE',),
+                'face': ('FACE',),
+                'crop': ('IMAGE',),
+                'mask': ('MASK',),
+                'warp': ('WARP',),
+                'blur_kernel_size': ('INT', {'default': 21, 'min': 1, 'max': 101, 'step': 2}),
+                'blur_sigma': ('FLOAT', {'default': 0.0, 'min': 0.0, 'max': 100.0, 'step': 0.1}),
+            }
+        }
+
+    def run(self, images, face, crop, mask, warp, blur_kernel_size, blur_sigma):
+        groups = defaultdict(list)
+        for f,c,m,w in zip(face, crop, mask, warp):
+            groups[f.image_idx].append((f.img,c,m,w))
+
+        results = []
+        for i, image in enumerate(images):
+            if i not in groups:
+                result = image
+            else:
+                values = groups[i]
+                crop, mask, warp = list(zip(*[x[1:] for x in values]))
+
+                # Apply Gaussian blur to masks for feathering
+                warped_masks = []
+                for single_warp, single_mask in zip(warp, mask):
+                    warped = np.clip(cv2.warpAffine(single_mask.numpy(),
+                                        cv2.invertAffineTransform(single_warp),
+                                        image.shape[1::-1],
+                                        flags=cv2.INTER_LANCZOS4), 0, 1)
+                    # Apply Gaussian blur for feathering
+                    if blur_kernel_size > 1:
+                        sigma = blur_sigma if blur_sigma > 0 else 0
+                        warped = cv2.GaussianBlur(warped, (blur_kernel_size, blur_kernel_size), sigma)
+                    warped_masks.append(warped)
+
+                full_mask = np.add.reduce(warped_masks, axis=0)[...,None]
+                swapped = np.add.reduce([
+                    np.clip(cv2.warpAffine(single_crop.cpu().numpy(),
+                                cv2.invertAffineTransform(single_warp),
+                                image.shape[1::-1],
+                                flags=cv2.INTER_LANCZOS4
+                                ), 0, 1) * single_mask[..., None]
+                    for single_crop, single_mask, single_warp in zip(crop, warped_masks, warp)
+                ], axis=0) / np.maximum(1, full_mask)
+                full_mask = np.minimum(1, full_mask)
+                result = (swapped + (1 - full_mask) * image.numpy())
+                result = torch.from_numpy(result)
+            results.append(result)
+
+        results = torch.stack(results)
+        return (results, )
+
+class WarpFaceBackPoisson:
+    RETURN_TYPES = ('IMAGE',)
+    FUNCTION = 'run'
+    CATEGORY = 'facetools'
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            'required': {
+                'images': ('IMAGE',),
+                'face': ('FACE',),
+                'crop': ('IMAGE',),
+                'mask': ('MASK',),
+                'warp': ('WARP',),
+                'clone_mode': (['NORMAL_CLONE', 'MIXED_CLONE'], {'default': 'NORMAL_CLONE'}),
+            }
+        }
+
+    def run(self, images, face, crop, mask, warp, clone_mode):
+        groups = defaultdict(list)
+        for f,c,m,w in zip(face, crop, mask, warp):
+            groups[f.image_idx].append((f.img,c,m,w))
+
+        results = []
+        mode = cv2.NORMAL_CLONE if clone_mode == 'NORMAL_CLONE' else cv2.MIXED_CLONE
+
+        for i, image in enumerate(images):
+            if i not in groups:
+                result = image
+            else:
+                values = groups[i]
+                result = image.numpy().copy()
+
+                for f_img, single_crop, single_mask, single_warp in values:
+                    # Warp the crop and mask back
+                    warped_crop = np.clip(cv2.warpAffine(single_crop.cpu().numpy(),
+                                cv2.invertAffineTransform(single_warp),
+                                image.shape[1::-1],
+                                flags=cv2.INTER_LANCZOS4), 0, 1)
+                    warped_mask = np.clip(cv2.warpAffine(single_mask.numpy(),
+                                cv2.invertAffineTransform(single_warp),
+                                image.shape[1::-1],
+                                flags=cv2.INTER_LANCZOS4), 0, 1)
+
+                    # Convert to uint8 for seamlessClone
+                    src = (warped_crop * 255).astype(np.uint8)
+                    dst = (result * 255).astype(np.uint8)
+                    mask_uint8 = (warped_mask * 255).astype(np.uint8)
+
+                    # Calculate center point
+                    coords = np.argwhere(mask_uint8 > 127)
+                    if len(coords) > 0:
+                        center_y, center_x = coords.mean(axis=0).astype(int)
+                        center = (int(center_x), int(center_y))
+
+                        try:
+                            # Apply Poisson blending
+                            result = cv2.seamlessClone(src, dst, mask_uint8, center, mode)
+                            result = result.astype(np.float32) / 255.0
+                        except:
+                            # Fallback to regular alpha blending if seamlessClone fails
+                            result = (warped_crop * warped_mask[..., None] +
+                                    result * (1 - warped_mask[..., None]))
+
+                result = torch.from_numpy(result)
+            results.append(result)
+
+        results = torch.stack(results)
+        return (results, )
+
+class WarpFaceBackErodeFeather:
+    RETURN_TYPES = ('IMAGE',)
+    FUNCTION = 'run'
+    CATEGORY = 'facetools'
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            'required': {
+                'images': ('IMAGE',),
+                'face': ('FACE',),
+                'crop': ('IMAGE',),
+                'mask': ('MASK',),
+                'warp': ('WARP',),
+                'erode_kernel_size': ('INT', {'default': 5, 'min': 1, 'max': 51, 'step': 2}),
+                'blur_kernel_size': ('INT', {'default': 21, 'min': 1, 'max': 101, 'step': 2}),
+                'blur_sigma': ('FLOAT', {'default': 0.0, 'min': 0.0, 'max': 100.0, 'step': 0.1}),
+            }
+        }
+
+    def run(self, images, face, crop, mask, warp, erode_kernel_size, blur_kernel_size, blur_sigma):
+        groups = defaultdict(list)
+        for f,c,m,w in zip(face, crop, mask, warp):
+            groups[f.image_idx].append((f.img,c,m,w))
+
+        results = []
+        for i, image in enumerate(images):
+            if i not in groups:
+                result = image
+            else:
+                values = groups[i]
+                crop, mask, warp = list(zip(*[x[1:] for x in values]))
+
+                # Apply erosion then Gaussian blur to masks
+                warped_masks = []
+                for single_warp, single_mask in zip(warp, mask):
+                    warped = np.clip(cv2.warpAffine(single_mask.numpy(),
+                                        cv2.invertAffineTransform(single_warp),
+                                        image.shape[1::-1],
+                                        flags=cv2.INTER_LANCZOS4), 0, 1)
+
+                    # Apply erosion to shrink mask
+                    if erode_kernel_size > 1:
+                        kernel = np.ones((erode_kernel_size, erode_kernel_size), np.uint8)
+                        warped_uint8 = (warped * 255).astype(np.uint8)
+                        warped_uint8 = cv2.erode(warped_uint8, kernel, iterations=1)
+                        warped = warped_uint8.astype(np.float32) / 255.0
+
+                    # Apply Gaussian blur for feathering
+                    if blur_kernel_size > 1:
+                        sigma = blur_sigma if blur_sigma > 0 else 0
+                        warped = cv2.GaussianBlur(warped, (blur_kernel_size, blur_kernel_size), sigma)
+
+                    warped_masks.append(warped)
+
+                full_mask = np.add.reduce(warped_masks, axis=0)[...,None]
+                swapped = np.add.reduce([
+                    np.clip(cv2.warpAffine(single_crop.cpu().numpy(),
+                                cv2.invertAffineTransform(single_warp),
+                                image.shape[1::-1],
+                                flags=cv2.INTER_LANCZOS4
+                                ), 0, 1) * single_mask[..., None]
+                    for single_crop, single_mask, single_warp in zip(crop, warped_masks, warp)
+                ], axis=0) / np.maximum(1, full_mask)
+                full_mask = np.minimum(1, full_mask)
+                result = (swapped + (1 - full_mask) * image.numpy())
+                result = torch.from_numpy(result)
+            results.append(result)
+
+        results = torch.stack(results)
+        return (results, )
+
 class MergeWarps:
     RETURN_TYPES = ('IMAGE','MASK','WARP')
     FUNCTION = 'run'
@@ -209,7 +413,7 @@ class MergeWarps:
                 'warp1': ('WARP',),
             }
         }
-    
+
     def run(self, crop0, mask0, warp0, crop1, mask1, warp1):
         crops = torch.vstack((crop0, crop1))
         masks = torch.vstack((mask0, mask1))
@@ -296,6 +500,9 @@ NODE_CLASS_MAPPINGS = {
     'DetectFaces': DetectFaces,
     'CropFaces': CropFaces,
     'WarpFacesBack': WarpFaceBack,
+    'WarpFaceBackFeathered': WarpFaceBackFeathered,
+    'WarpFaceBackPoisson': WarpFaceBackPoisson,
+    'WarpFaceBackErodeFeather': WarpFaceBackErodeFeather,
     'BiSeNetMask': BiSeNetMask,
     'JonathandinuMask': JonathandinuMask,
     'MergeWarps': MergeWarps,
@@ -307,6 +514,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'DetectFaces': 'DetectFaces',
     'CropFaces': 'CropFaces',
     'WarpFacesBack': 'Warp Faces Back',
+    'WarpFaceBackFeathered': 'Warp Faces Back (Feathered)',
+    'WarpFaceBackPoisson': 'Warp Faces Back (Poisson)',
+    'WarpFaceBackErodeFeather': 'Warp Faces Back (Erode+Feather)',
     'BiSeNetMask': 'BiSeNet Mask',
     'JonathandinuMask': 'Jonathandinu Mask',
     'MergeWarps': 'Merge Warps',
