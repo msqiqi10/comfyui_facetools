@@ -50,6 +50,7 @@ These custom nodes provide a rotation aware face extraction, paste back, and var
     - warp: 2x3 warp matrix
 - `OrderedFaceFilter`
   - works similarly to `ImpactSEGSOrderedfilter`
+  - criteria: `area`, `width`, `height`, `confidence`, `detection_confidence`, `area_confidence`, `area_detection_confidence`, `center_x`, `center_y`, `distance_center`
 - `GenderFaceFilter`
   - needs more work, as InsightFace gender classifier isn't very accurate.
 - `MergeWarps`

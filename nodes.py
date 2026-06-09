@@ -35,12 +35,25 @@ class GenderFaceFilter:
         return (filtered, rest)
 
 class OrderedFaceFilter:
+    ORDER_CRITERIA = [
+        'area',
+        'width',
+        'height',
+        'confidence',
+        'detection_confidence',
+        'area_confidence',
+        'area_detection_confidence',
+        'center_x',
+        'center_y',
+        'distance_center',
+    ]
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
             'required': {
                 'faces': ('FACE',),
-                'criteria': (['area'],),
+                'criteria': (cls.ORDER_CRITERIA,),
                 'order': (['descending', 'ascending'],),
                 'take_start': ('INT', {'default': 0, 'min': 0, 'step': 1}),
                 'take_count': ('INT', {'default': 1, 'min': 1, 'step': 1}),
@@ -52,11 +65,42 @@ class OrderedFaceFilter:
     FUNCTION = 'run'
     CATEGORY = 'facetools'
 
+    @staticmethod
+    def _bbox(face):
+        a, b, c, d = face.bbox
+        return float(a), float(b), float(c), float(d)
+
+    @classmethod
+    def _center(cls, face):
+        a, b, c, d = cls._bbox(face)
+        return (a + c) / 2, (b + d) / 2
+
+    @staticmethod
+    def _image_center(face):
+        img = getattr(face, 'img', None)
+        if img is None or not hasattr(img, 'shape') or len(img.shape) < 2:
+            return 0.0, 0.0
+        h, w = img.shape[:2]
+        return float(w) / 2, float(h) / 2
+
+    @classmethod
+    def _distance_center(cls, face):
+        cx, cy = cls._center(face)
+        image_cx, image_cy = cls._image_center(face)
+        return float(np.hypot(cx - image_cx, cy - image_cy))
+
     def run(self, faces, criteria, order, take_start, take_count):
-        filtered = []
-        rest = []
         funs = {
-            'area': lambda face: face.w * face.h
+            'area': lambda face: face.w * face.h,
+            'width': lambda face: face.w,
+            'height': lambda face: face.h,
+            'confidence': lambda face: float(getattr(face, 'confidence', 0.0)),
+            'detection_confidence': lambda face: float(getattr(face, 'detection_confidence', 0.0)),
+            'area_confidence': lambda face: face.w * face.h * float(getattr(face, 'confidence', 0.0)),
+            'area_detection_confidence': lambda face: face.w * face.h * float(getattr(face, 'detection_confidence', 0.0)),
+            'center_x': lambda face: self._center(face)[0],
+            'center_y': lambda face: self._center(face)[1],
+            'distance_center': self._distance_center,
         }
         sorted_faces = sorted(faces, key=funs[criteria], reverse=order == 'descending')
         filtered = sorted_faces[take_start:take_start+take_count]

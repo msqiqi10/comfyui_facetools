@@ -80,7 +80,7 @@ def get_submatrix_with_padding(img, a, b, c, d):
     return submatrix
 
 class Face:
-    def __init__(self, img, a, b, c, d) -> None:
+    def __init__(self, img, a, b, c, d, detection_confidence=0.0) -> None:
         self.img = img
         lmk = None
         best_score = 0
@@ -100,6 +100,8 @@ class Face:
         self.w = c - a
         self.h = d - b
         self.confidence = best_score
+        self.detection_confidence = float(detection_confidence)
+        self.det_confidence = self.detection_confidence
         
         self.kps = np.vstack([
             lmk[0,[37,38,40,41],:2].mean(axis=0),
@@ -141,7 +143,8 @@ def detect_faces(img, threshold):
         r = np.sqrt((c-a)**2 + (d-b)**2) / 2
         
         a,b,c,d = [int(x) for x in (cx - r, cy - r, cx + r, cy + r)]        
-        face = Face(img, a, b, c, d)
+        detection_confidence = float(box.conf[0].detach().cpu().item())
+        face = Face(img, a, b, c, d, detection_confidence)
         
         faces.append(face)
     return faces
